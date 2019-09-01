@@ -17,6 +17,10 @@ from mathutils import Vector, Matrix
 from mathutils import Matrix, Vector, Color
 from mathutils.bvhtree import BVHTree
 
+
+###############################
+### Topology Operators   ######
+###############################
 # COMPLETE
 # also known as 'face_neighbors_by_edge'/'face_neighbors_by_face' in 'cut_mesh'
 def face_neighbors(bmface:BMFace, by:str="edges", limit:set=set()):
@@ -48,7 +52,80 @@ def vert_neighbors(bmvert:BMVert):
 def vert_neighbors_manifold(bmvert:BMVert):
     return [v for v in vert_neighbors(bmvert) if v.is_manifold]
 
+#https://blender.stackexchange.com/questions/92406/circular-order-of-edges-around-vertex
+# Return edges around param vertex in counter-clockwise order
+def connectedEdgesFromVertex_CCW(vertex):
+    vertex.link_edges.index_update()
+    first_edge = vertex.link_edges[0]
 
+    edges_CCW_order = []
+
+    edge = first_edge
+    while edge not in edges_CCW_order:
+        edges_CCW_order.append(edge)
+        edge = rightEdgeForEdgeRegardToVertex(edge, vertex)
+
+    return edges_CCW_order
+# Return the right edge of param edge regard to param vertex
+#https://blender.stackexchange.com/questions/92406/circular-order-of-edges-around-vertex
+def rightEdgeForEdgeRegardToVertex(edge:BMEdge, vertex):
+    right_loop = None
+
+    for loop in edge.link_loops:
+        if loop.vert == vertex:
+            right_loop = loop
+            break
+    return loop.link_loop_prev.edge
+
+
+def decrease_vert_selection(bme:BMesh, selected_verts, iterations:int=1):
+    """ remove outer layer of selection
+
+    TODO, treat this as a region growing subtraction of the border
+    rather than iterate the whole selection each time.
+    """
+
+    # make a copy instead of modify in place, in case
+    # oritinal selection is important
+    sel_verts = set(selected_verts)
+
+    def is_boundary(v):
+        return not all([ed.other_vert(v) in sel_verts for ed in v.link_edges])
+
+    for i in range(iterations):
+
+        border = [v for v in sel_verts if is_boundary(v)] #TODO...smarter way to find new border...connected to old border
+        sel_verts.difference_update(border)
+
+    return sel_verts
+def increase_vert_selection(bme:BMesh, selected_verts, iterations:int=1):
+    """ grow outer layer of selection
+
+    TODO, treat this as a region growing subtraction of the border
+    rather than iterate the whole selection each time.
+    """
+
+    # make a copy instead of modify in place, in case
+    # oritinal selection is important
+    sel_verts = set(selected_verts)
+
+    new_verts = set()
+    for v in sel_verts:
+        new_verts.update(vert_neighbors(v))
+
+    iters = 0
+    while iters < iterations and new_verts:
+        iters += 1
+        new_candidates = set()
+        for v in new_verts:
+            new_candidates.update(vert_neighbors(v))
+
+        new_verts = new_candidates - sel_verts
+
+        if new_verts:
+            sel_verts |= new_verts
+
+    return sel_verts
 
 
 # COMPLETE
@@ -516,9 +593,6 @@ def partition_faces_between_edge_boundaries(bme:BMesh, input_faces:set, boundary
     return islands
 
 
-
-
-
 def edge_loops_from_bmedges(bme:BMesh, bm_edges:list, ret:dict={'VERTS'}):
     """
     Parameters:
@@ -674,11 +748,6 @@ def face_region_boundary_loops(bme:BMesh, sel_faces:list):
     geom_dict = edge_loops_from_bmedges(bme, edges_raw, ret={'VERTS','EDGES'})
 
     return geom_dict
-
-
-
-
-
 
 
 def find_face_loop(bme:BMesh, edge:BMEdge, select:bool=False):
@@ -900,6 +969,9 @@ def edge_loop_neighbors(bme:BMesh, edge_loop:list, strict:bool=False, trim_tails
 
     return geom_dict
 
+######################################
+# BMESH CREATION FUNCTIONS           #
+######################################
 
 def join_bmesh(source, target, src_trg_map, src_mx=None, trg_mx=None):
     """
@@ -990,7 +1062,8 @@ def join_bmesh(source, target, src_trg_map, src_mx=None, trg_mx=None):
             print('seems some verts were left in that should not have been')
 
     del src_trg_map
-def join_bmesh(source, target, src_mx=None, trg_mx=None):
+    
+def join_bmesh2(source, target, src_mx=None, trg_mx=None):
 
     src_trg_map = dict()
     L = len(target.verts)
@@ -1092,12 +1165,8 @@ def new_bmesh_from_bmelements(geom):
     return out_bme
 
 
-
-
-
-
-
 # doesn't belong here
+
 def join_objects(obs, name:str=""):
     """
     uses BMesh to join objects.  Advantage is that it is context
@@ -1138,7 +1207,88 @@ def join_objects(obs, name:str=""):
     target_bme.free()
     return new_ob
 
+def join_bmesh_map(source:BMesh, target:BMesh, src_trg_map:set=None, src_mx:Matrix=None, trg_mx:Matrix=None):
+    """
 
+    Parameters:
+        source (BMesh): BMesh object source
+        target (BMesh): BMesh object target
+        src_trg_map (set): set of indices
+        src_mx (Matrix): matrix of the source BMesh object
+        trg_mx (Matrix): matrix of the target BMesh object
+
+    Returns:
+        None
+    """
+
+
+    L = len(target.verts)
+
+    if not src_trg_map:
+        src_trg_map = {-1:-1}
+    l = len(src_trg_map)
+    print("There are %i items in the vert map" % len(src_trg_map))
+    if not src_mx:
+        src_mx = Matrix.Identity(4)
+
+    if not trg_mx:
+        trg_mx = Matrix.Identity(4)
+        i_trg_mx = Matrix.Identity(4)
+    else:
+        i_trg_mx = trg_mx.inverted()
+
+
+    old_bmverts = [v for v in target.verts]  # this will store them in order
+    new_bmverts = [] # these will be created in order
+
+    source.verts.ensure_lookup_table()
+
+    for v in source.verts:
+        if v.index not in src_trg_map:
+            new_ind = len(target.verts)
+            new_bv = target.verts.new(i_trg_mx * src_mx * v.co)
+            new_bmverts.append(new_bv)  #gross...append
+            src_trg_map[v.index] = new_ind
+
+        else:
+            print("vert alread in the map %i" % v.index)
+
+    lverts = old_bmverts + new_bmverts
+
+    target.verts.index_update()
+    target.verts.ensure_lookup_table()
+
+    new_bmfaces = []
+    for f in source.faces:
+        v_inds = []
+        for v in f.verts:
+            new_ind = src_trg_map[v.index]
+            v_inds.append(new_ind)
+
+        if any([i > len(lverts)-1 for i in v_inds]):
+            print("impending index error")
+            print(len(lverts))
+            print(v_inds)
+
+        if target.faces.get(tuple(lverts[i] for i in v_inds)):
+            print(v_inds)
+            continue
+        new_bmfaces += [target.faces.new(tuple(lverts[i] for i in v_inds))]
+
+        target.faces.ensure_lookup_table()
+    target.verts.ensure_lookup_table()
+
+    new_L = len(target.verts)
+
+    if src_trg_map:
+        if new_L != L + len(source.verts) -l:
+            print("seems some verts were left in that should not have been")
+            
+            
+        
+###################################
+#  Faster Bmesh Ops               #
+###################################          
 def bmesh_ops_delete(bme:BMesh, geom:list, context:str="VERTS"):
     """
 
@@ -1216,6 +1366,7 @@ def bmesh_ops_delete(bme:BMesh, geom:list, context:str="VERTS"):
             bme.edges.remove(e)
         for f in faces:
             bme.faces.remove(f)
+                       
 def bmesh_delete(bme:BMesh, verts:set=None, edges:set=None, faces:set=None):
     """
 
@@ -1239,16 +1390,6 @@ def bmesh_delete(bme:BMesh, verts:set=None, edges:set=None, faces:set=None):
             if f.is_valid: bme.verts.remove(f)
 
 
-
-
-
-
-
-
-
-
-
-
 # d3g only
 def bme_rip_vertex(bme, bmvert):
 
@@ -1265,6 +1406,40 @@ def bme_rip_vertex(bme, bmvert):
         new_f = bme.faces.new(vs)
 
     bme.verts.remove(bmvert)
+    
+
+
+####################################
+###  Geometric Operators  ##########
+####################################
+def get_com_bmverts(lverts):
+    n_verts = len(lverts)
+    COM = Vector((0,0,0))
+    for v in lverts:
+        COM += v.co
+    COM *= 1/n_verts
+    return COM
+
+def bound_box_bmverts(bmvs:iter):
+    bounds = []
+    for i in range(0,3):
+        components = [v.co[i] for v in bmvs]
+        low = min(components)
+        high = max(components)
+        bounds.append((low,high))
+
+    return bounds
+# Doesn't belong here, but is almost alwasy used on the return of bound_box_bmverts
+def bbox_center(bounds):
+
+    x = 0.5 * (bounds[0][0] + bounds[0][1])
+    y = 0.5 * (bounds[1][0] + bounds[1][1])
+    z = 0.5 * (bounds[2][0] + bounds[2][1])
+
+    return Vector((x,y,z))
+
+#this one goes in geometry because of the flat part
+#also a topological operator    
 def bme_linked_flat_faces(bme:BMesh, start_face:BMFace, angle:float, max_iters=10000):
     """ takes a bmedge, and walks perpendicular to it
 
@@ -1306,6 +1481,9 @@ def bme_linked_flat_faces(bme:BMesh, start_face:BMFace, angle:float, max_iters=1
         new_faces = newer_faces
 
     return list(flat_faces)
+
+#Super Weird, Super Specific, Needs to go into it's own file
+#Note a very genericly useful utility
 def remove_undercuts(context:BMesh, ob:Object, view:Vector, world:bool=True, smooth:bool=True, epsilon:float=0.000001):
     """
 
@@ -1564,99 +1742,6 @@ def remove_undercuts(context:BMesh, ob:Object, view:Vector, world:bool=True, smo
     del bvh
 
     return
-def join_bmesh_map(source:BMesh, target:BMesh, src_trg_map:set=None, src_mx:Matrix=None, trg_mx:Matrix=None):
-    """
-
-    Parameters:
-        source (BMesh): BMesh object source
-        target (BMesh): BMesh object target
-        src_trg_map (set): set of indices
-        src_mx (Matrix): matrix of the source BMesh object
-        trg_mx (Matrix): matrix of the target BMesh object
-
-    Returns:
-        None
-    """
-
-
-    L = len(target.verts)
-
-    if not src_trg_map:
-        src_trg_map = {-1:-1}
-    l = len(src_trg_map)
-    print("There are %i items in the vert map" % len(src_trg_map))
-    if not src_mx:
-        src_mx = Matrix.Identity(4)
-
-    if not trg_mx:
-        trg_mx = Matrix.Identity(4)
-        i_trg_mx = Matrix.Identity(4)
-    else:
-        i_trg_mx = trg_mx.inverted()
-
-
-    old_bmverts = [v for v in target.verts]  # this will store them in order
-    new_bmverts = [] # these will be created in order
-
-    source.verts.ensure_lookup_table()
-
-    for v in source.verts:
-        if v.index not in src_trg_map:
-            new_ind = len(target.verts)
-            new_bv = target.verts.new(i_trg_mx * src_mx * v.co)
-            new_bmverts.append(new_bv)  #gross...append
-            src_trg_map[v.index] = new_ind
-
-        else:
-            print("vert alread in the map %i" % v.index)
-
-    lverts = old_bmverts + new_bmverts
-
-    target.verts.index_update()
-    target.verts.ensure_lookup_table()
-
-    new_bmfaces = []
-    for f in source.faces:
-        v_inds = []
-        for v in f.verts:
-            new_ind = src_trg_map[v.index]
-            v_inds.append(new_ind)
-
-        if any([i > len(lverts)-1 for i in v_inds]):
-            print("impending index error")
-            print(len(lverts))
-            print(v_inds)
-
-        if target.faces.get(tuple(lverts[i] for i in v_inds)):
-            print(v_inds)
-            continue
-        new_bmfaces += [target.faces.new(tuple(lverts[i] for i in v_inds))]
-
-        target.faces.ensure_lookup_table()
-    target.verts.ensure_lookup_table()
-
-    new_L = len(target.verts)
-
-    if src_trg_map:
-        if new_L != L + len(source.verts) -l:
-            print("seems some verts were left in that should not have been")
-def bound_box_bmverts(bmvs:iter):
-    bounds = []
-    for i in range(0,3):
-        components = [v.co[i] for v in bmvs]
-        low = min(components)
-        high = max(components)
-        bounds.append((low,high))
-
-    return bounds
-# Doesn't belong here
-def bbox_center(bounds):
-
-    x = 0.5 * (bounds[0][0] + bounds[0][1])
-    y = 0.5 * (bounds[1][0] + bounds[1][1])
-    z = 0.5 * (bounds[2][0] + bounds[2][1])
-
-    return Vector((x,y,z))
 
 
 # segmentation only
@@ -1664,76 +1749,4 @@ def ensure_lookup(bme:BMesh):
     bme.verts.ensure_lookup_table()
     bme.edges.ensure_lookup_table()
     bme.faces.ensure_lookup_table()
-#https://blender.stackexchange.com/questions/92406/circular-order-of-edges-around-vertex
-# Return edges around param vertex in counter-clockwise order
-def connectedEdgesFromVertex_CCW(vertex):
 
-    vertex.link_edges.index_update()
-    first_edge = vertex.link_edges[0]
-
-    edges_CCW_order = []
-
-    edge = first_edge
-    while edge not in edges_CCW_order:
-        edges_CCW_order.append(edge)
-        edge = rightEdgeForEdgeRegardToVertex(edge, vertex)
-
-    return edges_CCW_order
-# Return the right edge of param edge regard to param vertex
-#https://blender.stackexchange.com/questions/92406/circular-order-of-edges-around-vertex
-def rightEdgeForEdgeRegardToVertex(edge:BMEdge, vertex):
-    right_loop = None
-
-    for loop in edge.link_loops:
-        if loop.vert == vertex:
-            right_loop = loop
-            break
-    return loop.link_loop_prev.edge
-def decrease_vert_selection(bme:BMesh, selected_verts, iterations:int=1):
-    """ remove outer layer of selection
-
-    TODO, treat this as a region growing subtraction of the border
-    rather than iterate the whole selection each time.
-    """
-
-    # make a copy instead of modify in place, in case
-    # oritinal selection is important
-    sel_verts = set(selected_verts)
-
-    def is_boundary(v):
-        return not all([ed.other_vert(v) in sel_verts for ed in v.link_edges])
-
-    for i in range(iterations):
-
-        border = [v for v in sel_verts if is_boundary(v)] #TODO...smarter way to find new border...connected to old border
-        sel_verts.difference_update(border)
-
-    return sel_verts
-def increase_vert_selection(bme:BMesh, selected_verts, iterations:int=1):
-    """ grow outer layer of selection
-
-    TODO, treat this as a region growing subtraction of the border
-    rather than iterate the whole selection each time.
-    """
-
-    # make a copy instead of modify in place, in case
-    # oritinal selection is important
-    sel_verts = set(selected_verts)
-
-    new_verts = set()
-    for v in sel_verts:
-        new_verts.update(vert_neighbors(v))
-
-    iters = 0
-    while iters < iterations and new_verts:
-        iters += 1
-        new_candidates = set()
-        for v in new_verts:
-            new_candidates.update(vert_neighbors(v))
-
-        new_verts = new_candidates - sel_verts
-
-        if new_verts:
-            sel_verts |= new_verts
-
-    return sel_verts
